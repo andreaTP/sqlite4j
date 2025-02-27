@@ -13,7 +13,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.11.4</junit.version>
         <surefire.version>3.5.2</surefire.version>
-        <chicory.version>1.1.0</chicory.version>
+        <chicory.version>999-SNAPSHOT</chicory.version>
     </properties>
 
     <licenses>
@@ -173,7 +173,7 @@
                 </executions>
             </plugin>
 
-            <plugin>
+            <!-- <plugin>
                 <groupId>com.dylibso.chicory</groupId>
                 <artifactId>aot-maven-plugin-experimental</artifactId>
                 <version>${chicory.version}</version>
@@ -189,7 +189,7 @@
                     </configuration>
                 </execution>
                 </executions>
-            </plugin>
+            </plugin> -->
         </plugins>
 
     </build>
@@ -297,6 +297,12 @@
         <dependency>
             <groupId>com.dylibso.chicory</groupId>
             <artifactId>host-module-annotations-experimental</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.dylibso.chicory</groupId>
+            <artifactId>observable-runtime</artifactId>
+            <version>999-SNAPSHOT</version>
         </dependency>
 
         <dependency>
