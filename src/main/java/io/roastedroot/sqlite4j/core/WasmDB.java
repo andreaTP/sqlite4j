@@ -9,6 +9,7 @@ import com.dylibso.chicory.runtime.Instance;
 import com.dylibso.chicory.runtime.Memory;
 import com.dylibso.chicory.wasi.WasiOptions;
 import com.dylibso.chicory.wasi.WasiPreview1;
+import com.dylibso.chicory.wasm.Parser;
 import com.dylibso.chicory.wasm.WasmModule;
 import com.dylibso.chicory.wasm.types.MemoryLimits;
 import io.roastedroot.sqlite4j.BusyHandler;
@@ -41,7 +42,8 @@ import java.sql.SQLException;
 
 public class WasmDB extends DB implements WasmDBImports {
     public static final int PTR_SIZE = 4;
-    private static final WasmModule MODULE = SQLiteModule.load();
+    // private static final WasmModule MODULE = SQLiteModule.load();
+    private static final WasmModule MODULE = Parser.parse(Path.of("wasm-lib/libsqlite3.wasm"));
 
     private final Instance instance;
     private final WasiPreview1 wasiPreview1;
@@ -73,7 +75,7 @@ public class WasmDB extends DB implements WasmDBImports {
         wasiPreview1 = WasiPreview1.builder().withOptions(wasiOpts).build();
         instance =
                 Instance.builder(MODULE)
-                        .withMachineFactory(SQLiteModule::create)
+                        // .withMachineFactory(SQLiteModule::create)
                         .withMemoryFactory(ByteArrayMemory::new)
                         .withImportValues(
                                 ImportValues.builder()

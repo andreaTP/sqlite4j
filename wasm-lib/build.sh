@@ -54,6 +54,7 @@ cp ${SCRIPT_DIR}/sqlite3_helpers.c ${SCRIPT_DIR}/sqlite-amalgamation/
       -mmutable-globals -mmultivalue \
       -mbulk-memory -mreference-types \
       -mexec-model=reactor \
+      -mtail-call \
       -g0 -Oz \
       -DSQLITE_ENABLE_LOAD_EXTENSION=0 \
       -DSQLITE_HAVE_ISNAN=1 \
