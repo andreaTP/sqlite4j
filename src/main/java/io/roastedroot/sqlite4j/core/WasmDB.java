@@ -1,7 +1,7 @@
 package io.roastedroot.sqlite4j.core;
 
-import static io.roastedroot.sqlite4j.core.wasm.WasmDBExports.SQLITE_SERIALIZE_NOCOPY;
-import static io.roastedroot.sqlite4j.core.wasm.WasmDBExports.SQLITE_UTF8;
+import static io.roastedroot.sqlite4j.WasmDBExports.SQLITE_SERIALIZE_NOCOPY;
+import static io.roastedroot.sqlite4j.WasmDBExports.SQLITE_UTF8;
 
 import com.dylibso.chicory.runtime.ByteArrayMemory;
 import com.dylibso.chicory.runtime.ImportValues;
@@ -21,12 +21,12 @@ import io.roastedroot.sqlite4j.SQLiteException;
 import io.roastedroot.sqlite4j.SQLiteModule;
 import io.roastedroot.sqlite4j.SQLiteUpdateListener;
 import io.roastedroot.sqlite4j.Version;
+import io.roastedroot.sqlite4j.WasmDBExports;
 import io.roastedroot.sqlite4j.core.wasm.BusyHandlerStore;
 import io.roastedroot.sqlite4j.core.wasm.CollationStore;
 import io.roastedroot.sqlite4j.core.wasm.DummyWasmDBImports;
 import io.roastedroot.sqlite4j.core.wasm.ProgressHandlerStore;
 import io.roastedroot.sqlite4j.core.wasm.UDFStore;
-import io.roastedroot.sqlite4j.core.wasm.WasmDBExports;
 import io.roastedroot.sqlite4j.core.wasm.WasmDBImports;
 import java.io.FileInputStream;
 import java.io.IOException;

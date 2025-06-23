@@ -1,4 +1,4 @@
-package io.roastedroot.sqlite4j.core.wasm;
+package io.roastedroot.sqlite4j;
 
 import static io.roastedroot.sqlite4j.core.Codes.SQLITE_NULL;
 
@@ -262,7 +262,9 @@ public class WasmDBExports {
     //    const char **pzTail     /* OUT: Pointer to unused portion of zSql */
     public int prepareV2(
             int dbPtr, int zSql, int nByte, /* OUT */ int stmtPtrPtr, /* OUT */ int pzTail) {
-        return (int) prepareV2.apply(dbPtr, zSql, nByte, stmtPtrPtr, pzTail)[0];
+        return SQLiteModuleMachineFuncGroup_0.func_165(
+                dbPtr, zSql, nByte, stmtPtrPtr, pzTail, instance.memory(), instance);
+        // return (int) prepareV2.apply(dbPtr, zSql, nByte, stmtPtrPtr, pzTail)[0];
     }
 
     //    sqlite3*,                                  /* An open database */
