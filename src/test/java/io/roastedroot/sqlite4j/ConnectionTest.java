@@ -462,6 +462,16 @@ public class ConnectionTest {
     }
 
     @Test
+    public void succeedOpenDatabaseNoCreateInConnectionString() throws Exception {
+        Path tmp = Files.createTempDirectory("sqlite-temp-dir");
+        String connString = String.format("jdbc:sqlite:%s", tmp.resolve("inner-folder").resolve("my.db"));
+        Connection conn = DriverManager.getConnection(connString);
+        conn.createStatement().execute("drop table if exists test");
+        conn.createStatement().execute("create table test (id int not null)");
+        conn.close();
+    }
+
+    @Test
     public void failsOpenDatabaseNoCreateUnavailablePath() throws Exception {
         assertThatThrownBy(
                         () ->
