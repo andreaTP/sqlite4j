@@ -2,50 +2,62 @@
 
 ## Overview
 
-SQLite's VDBE (Virtual Database Engine) main loop compiles to a single 24KB WASM function (`func 482`). When Chicory's AOT compiler translates this to Java bytecode, the resulting method exceeds HotSpot's 8KB C2 JIT compilation threshold, falling back to the slower C1 compiler or interpreter. The `split_func482.py` script transforms the WASM binary to split this function into a thin dispatcher plus 5 group functions, each small enough for C2 JIT compilation.
+When Chicory's AOT compiler translates WASM functions to Java bytecode, methods larger than ~8KB exceed HotSpot's C2 JIT compilation threshold, falling back to the slower C1 compiler or interpreter. The `split_wasm.py` script transforms the WASM binary to split oversized functions into smaller pieces, each fitting within the C2 threshold.
+
+Three functions are split:
+
+| Function | Original Size | Strategy | Pieces | Description |
+|----------|--------------|----------|--------|-------------|
+| func 482 | ~24KB | br_table dispatch | 1 dispatcher + 5 groups | VDBE main loop (278 opcode handlers) |
+| func 180 | ~31KB | br_table dispatch | 1 dispatcher + 4 groups | Expression evaluator (186 opcode handlers) |
+| func 1194 | ~21KB | block extraction | 1 main + 4 helpers | Query optimizer (deeply nested blocks) |
+
+Func 1177 (~6.5KB) was analyzed but is already under the 8KB threshold, so it is not split.
 
 ## How It Works
 
 The transformation operates at the WASM text format (WAT) level:
 
 1. **Disassemble** the input `.wasm` to `.wat` using `wasm2wat`
-2. **Parse** func 482 to identify the `br_table` dispatch, 278 opcode handlers, and structural control flow
-3. **Replace** the handler code in func 482 with stubs that record a handler index and exit the dispatch
-4. **Generate** 5 group functions that contain the actual handler logic
+2. **Parse** each target function to identify its structure
+3. **Transform** each function using the appropriate strategy (see below)
+4. **Append** generated helper/group functions at the end of the module
 5. **Reassemble** the modified WAT back to `.wasm` using `wat2wasm`
 
-Locals are passed between the main function and group functions by spilling/reloading them through an extended region of the stack frame in linear memory.
+Locals are passed between the main function and helper functions by spilling/reloading through an extended region of the stack frame in linear memory.
 
-## Architecture
+## Strategy A: br_table Dispatch (funcs 482, 180)
+
+Used for functions that contain a `br_table` switch dispatching to many inline opcode handlers.
+
+### Architecture
 
 Before splitting:
 
 ```
-func 482 (~24KB)
+func (original, ~24-31KB)
 ├── Setup (stack frame, field loads, init)
-├── loop @1 (outer loop)
-│   └── loop @2 (inner loop)
-│       └── block @3 → block @4 → block @5 → loop @6 → if @7
-│           └── block @8 (handler block)
-│               ├── 277 nested dispatch blocks (@9..@285)
-│               ├── br_table (opcode → handler)
-│               └── 278 opcode handlers (inline)
+├── Dispatch structure (blocks, loops)
+│   └── Handler container block
+│       ├── N nested dispatch blocks
+│       ├── br_table (opcode → handler)
+│       └── N+1 opcode handlers (inline)
 └── Structural code (cleanup, loop control, epilogue)
 ```
 
 After splitting:
 
 ```
-func 482 (~3KB)                     group_0 (~5KB)    group_1..4 (~5KB each)
-├── Setup                           ├── Load locals    ...
-├── Spill locals to memory          ├── br_table dispatch
-├── loop @1 / loop @2 / ...         ├── Handler 0 code
-│   └── block @8                    ├── Handler 1 code
-│       ├── 277 dispatch blocks     ├── ...
-│       ├── br_table (unchanged)    ├── Handler 55 code
-│       └── 278 stubs:              ├── Store locals
-│           set handler_idx, br @8  └── Return continuation code
-├── Post-spill fix (local 28)
+func (dispatcher, ~3KB)           group_0 (~5-8KB)    group_1..N (~5-8KB each)
+├── Setup                         ├── Load locals      ...
+├── Spill locals to memory        ├── br_table dispatch
+├── Dispatch structure            ├── Handler 0 code
+│   └── Handler container         ├── Handler 1 code
+│       ├── Dispatch blocks       ├── ...
+│       ├── br_table (unchanged)  ├── Store locals
+│       └── Stubs:                └── Return continuation code
+│           set handler_idx, br
+├── Post-spill fix (opcode local)
 ├── loop $redispatch
 │   ├── Call group function
 │   ├── Handle cross-group jumps
@@ -55,11 +67,11 @@ func 482 (~3KB)                     group_0 (~5KB)    group_1..4 (~5KB each)
 └── Structural code (unchanged)
 ```
 
-## Transformation Details
+### Transformation Details
 
 Four key transformations are applied to handler code when moving it into group functions:
 
-### 1. Local Index Offset
+#### 1. Local Index Offset
 
 Group functions receive two parameters (`$frame: i32`, `$handler_idx: i32`) that occupy local indices 0 and 1. All original local references are shifted by +2:
 
@@ -69,69 +81,154 @@ local.set N  →  local.set N+2
 local.tee N  →  local.tee N+2
 ```
 
-### 2. Branch Depth Adjustment for `$continue`
+#### 2. Branch Depth Adjustment for `$continue`
 
-In the original function, `br` to label `@8` means "continue to next opcode." In a group function, `@8` no longer exists. Instead, the depth is recomputed to target the group function's `$continue` block:
+In the original function, `br` to the handler container means "continue to next opcode." In a group function, that label no longer exists. The depth is recomputed to target the group function's `$continue` block:
 
 ```
-Original:  br (277 - H)       ;; where H = handler index within the original function
-Group:     br (G_size - 1 - H_local + internal_depth)  ;; H_local = H - group_start
+Original:  br (N_blocks - H)
+Group:     br (G_size - 1 - H_local + internal_depth)
 ```
 
-### 3. Structural Exit Conversion
+#### 3. Structural Exit Conversion
 
-Branches to structural labels (`@7` through `@1`) cannot be expressed as direct jumps from group functions. They are converted to: set a continuation code in the `$result` local, then branch to `$exit`:
+Branches to structural labels (enclosing loops, blocks, ifs) cannot be expressed as direct jumps from group functions. They are converted to: set a continuation code in the `$result` local, then branch to `$exit`:
 
 ```wasm
-;; Original:   br <depth_to_@6>
+;; Original:   br <depth_to_structural_label>
 ;; Becomes:
-i32.const 5          ;; continuation code for @6
-local.set 36         ;; $result (local index 2 + 34 original locals)
+i32.const <continuation_code>
+local.set <result_local>
 br <depth_to_$exit>
 ```
 
 For `br_if`, the pattern wraps in an `if/end` block (adding +1 to the exit depth).
 
-### 4. Cross-Group Jump Handling
+#### 4. Cross-Group Jump Handling
 
-Handler 22 contains jumps to handlers 275 and 276, which may reside in a different group. These are encoded as continuation code `100 + target_handler_index` and branch to `$exit`. The main function's `$redispatch` loop detects codes >= 100, subtracts 100 to recover the target handler index, and re-calls the appropriate group function.
+Some handlers contain jumps to handlers in other groups. These are encoded as continuation code `100 + target_handler_index` and branch to `$exit`. The main function's `$redispatch` loop detects codes >= 100, subtracts 100 to recover the target handler index, and re-calls the appropriate group function.
+
+### Per-Function Details
+
+#### Func 482 (VDBE main loop)
+
+- **Locals:** 34 total (2 i32 params + 30 i32 + 2 i64)
+- **Frame pointer:** local 14, frame size 1280 bytes
+- **Handlers:** 278 → 5 groups of ~56 each
+- **Opcode local:** 28 (post-dispatch fix required)
+
+#### Func 180 (expression evaluator)
+
+- **Locals:** 48 total (1 i32 param + 39 i32 + 6 i64 + 2 f64)
+- **Frame pointer:** local 6, frame size 512 bytes
+- **Handlers:** 186 → 4 groups of ~47 each
+- **Opcode local:** 1 (post-dispatch fix required)
+- **Key difference:** has f64 locals requiring `f64.load`/`f64.store` in spill/reload
+
+## Strategy B: Block Extraction (func 1194)
+
+Used for functions with deeply nested blocks but no single dispatch table. Large complete blocks are extracted into helper functions.
+
+### Architecture
+
+Before splitting:
+
+```
+func 1194 (~21KB)
+├── Setup
+├── Deep nesting (@1..@13)
+│   ├── block @13 #1 (3,786 lines)    ← extracted
+│   ├── if @13 #2 (509 lines)         ← extracted
+│   ├── block @8 (2,155 lines)        ← extracted
+│   └── block @7 (1,022 lines)        ← extracted
+└── Epilogue
+```
+
+After splitting:
+
+```
+func 1194 (~8KB)                  helper_0 (~9KB)    helper_1..3 (~2-6KB)
+├── Setup                         ├── Load locals     ...
+├── Deep nesting                  ├── Execute block
+│   ├── [spill → call helper_0    ├── Store locals
+│   │    → reload → dispatch]     └── Return continuation code
+│   ├── [spill → call helper_1
+│   │    → reload → dispatch]
+│   ├── [spill → call helper_2
+│   │    → reload → dispatch]
+│   └── [spill → call helper_3
+│        → reload → dispatch]
+└── Epilogue
+```
+
+### How It Works
+
+1. **Identify extraction targets:** complete blocks at chosen nesting depths (7, 8, 13) that exceed a minimum size threshold
+2. **Ancestor conflict resolution:** when targets are nested (ancestor contains descendant), keep the ancestor and remove the descendant
+3. **For each target, generate a helper function:**
+   - Parameters: `(frame_ptr: i32, block_idx: i32)` → result i32
+   - Load locals from spill area on entry
+   - Execute the extracted block code with transformed branches:
+     - Internal branches: adjusted for new block structure
+     - Branches to enclosing blocks: converted to set continuation code + `br $exit`
+   - Store locals back before returning
+   - Return continuation code (0 = normal fall-through)
+4. **In the main function,** replace each extracted block with:
+   - Spill locals to memory
+   - Call helper function
+   - Save continuation code to a spare local
+   - Reload locals from memory
+   - Dispatch on continuation code via `br_table` to the appropriate structural label
+
+### Continuation Code Dispatch
+
+Each helper returns an integer continuation code:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Normal exit (fall through to next code) |
+| N | Branch to the Nth enclosing structural label |
+
+The main function dispatches on this code using a `br_table`:
+
+```wasm
+;; After reload:
+local.get <spare_local>          ;; saved continuation code
+br_table 0 1 2 ... max max       ;; 0 = fall through, N = br to enclosing label
+```
 
 ## Spill/Reload Mechanism
 
-The original func 482 has 34 locals: 2 `i32` params + 30 declared `i32` + 2 declared `i64`. These are passed to group functions through an extended region of the stack frame.
+Both strategies use the same mechanism to pass locals between the main function and helpers. The original stack frame is extended with a spill area where all locals are stored/loaded.
 
-### Memory Layout
+### How It Works
 
-The original stack frame is 1280 bytes. The transformation extends it to 1440 bytes (+160 for the spill area):
+1. **Spill** — the main function stores all locals to `[frame_ptr + spill_base..]`
+2. **Call** — pass the frame pointer (and handler/block index) to the helper
+3. **Helper loads** locals from the spill area on entry
+4. **Helper stores** locals back to the spill area before returning
+5. **Reload** — the main function loads all locals back from the spill area
 
-| Offset | Local | Type | Size |
-|---|---|---|---|
-| 1280 | local 0 | i32 | 4 bytes |
-| 1284 | local 1 | i32 | 4 bytes |
-| ... | ... | ... | ... |
-| 1400 | local 30 | i32 | 4 bytes |
-| 1404 | local 31 | i32 | 4 bytes |
-| 1408 | local 32 | i64 | 8 bytes |
-| 1416 | local 33 | i64 | 8 bytes |
+### Type Support
 
-The frame pointer is `local 14` in the original function. Every call to a group function is bracketed by:
+The spill/reload mechanism supports all WASM numeric types:
 
-1. **Spill** — store all 34 locals from the main function to `[frame + 1280..]`
-2. **Call** — pass the frame pointer and handler index
-3. **Group function loads** locals from the spill area on entry, **stores** them back before returning
-4. **Reload** — the main function loads all 34 locals back from the spill area
+| Type | Load Instruction | Store Instruction | Size |
+|------|-----------------|-------------------|------|
+| i32 | `i32.load` | `i32.store` | 4 bytes |
+| i64 | `i64.load` | `i64.store` | 8 bytes |
+| f32 | `f32.load` | `f32.store` | 4 bytes |
+| f64 | `f64.load` | `f64.store` | 8 bytes |
 
-## The Local 28 Fix
+### The Opcode Local Fix (br_table strategy only)
 
-Inside the dispatch blocks (between the spill and `block @8`'s end), the original code executes `local.tee 28` to set the opcode index. This happens *after* the locals have already been spilled to memory, so the spill area would contain a stale value for local 28.
-
-A post-dispatch store fixes this:
+Inside the dispatch blocks, the original code executes `local.tee` to set the opcode index *after* locals have been spilled. A post-dispatch store fixes the stale value:
 
 ```wasm
-;; Right after block @8 closes, before calling the group function:
-local.get 14              ;; frame pointer
-local.get 28              ;; opcode index (set by local.tee 28 in dispatch)
-i32.store offset=1392     ;; SPILL_BASE + 28 * 4
+;; Right after the handler container block closes:
+local.get <frame_ptr>
+local.get <opcode_local>
+i32.store offset=<spill_base + opcode_local * 4>
 ```
 
 ## Usage
@@ -146,14 +243,14 @@ Install the [WebAssembly Binary Toolkit (WABT)](https://github.com/WebAssembly/w
 ### Running the Script
 
 ```bash
-python3 split_func482.py wasm-lib/libsqlite3.wasm wasm-lib/libsqlite3_split.wasm
+python3 split_wasm.py wasm-lib/libsqlite3.wasm wasm-lib/libsqlite3_split.wasm
 ```
 
 The script:
 1. Converts the input WASM to WAT (temporary file)
-2. Parses and transforms func 482
-3. Writes the modified WAT to `wasm-lib/libsqlite3_split.wat`
-4. Compiles it to `wasm-lib/libsqlite3_split.wasm` via `wat2wasm`
+2. Parses and transforms each target function (482, 180, 1194)
+3. Appends generated helper/group functions at the end of the module
+4. Compiles the modified WAT to the output `.wasm` via `wat2wasm`
 5. Reports input/output sizes and overhead
 
 ### Build Integration
@@ -168,16 +265,33 @@ No additional build steps are required once `libsqlite3_split.wasm` has been gen
 
 ## Configuration
 
-Tunable parameters are defined at the top of `split_func482.py`:
+Each target function has a configuration dict at the top of `split_wasm.py`. Key fields:
 
-| Parameter | Default | Description |
-|---|---|---|
-| `NUM_GROUPS` | 5 | Number of group functions to generate. Handlers are divided equally across groups (~56 handlers each). |
-| `SPILL_BASE` | 1280 | Byte offset within the stack frame where the local spill area begins. Must not overlap with the original frame's usage. |
-| `NEW_FRAME_SIZE` | 1440 | Extended stack frame size in bytes. Must be >= `SPILL_BASE` + (32 * 4) + (2 * 8) = 1424. |
-| `FUNC_482_INDEX` | 482 | WASM function index of the VDBE main loop. |
-| `NUM_IMPORTS` | 58 | Number of imported functions in the WASM module (affects function index calculation). |
-| `CONTINUATION_CODES` | (dict) | Maps structural label numbers to continuation return codes used by the main function's dispatch logic. |
+| Field | Description |
+|-------|-------------|
+| `func_index` | WASM function index |
+| `strategy` | `'br_table'` or `'block_extraction'` |
+| `param_types` | List of parameter types (e.g., `['i32', 'i32']`) |
+| `declared_types` | List of declared local types |
+| `frame_pointer_local` | Local index holding the frame pointer |
+| `orig_frame_size` | Original stack frame size in bytes |
+
+**br_table strategy additional fields:**
+
+| Field | Description |
+|-------|-------------|
+| `num_groups` | Number of group functions to generate |
+| `opcode_local` | Local set by `local.tee` before `br_table` |
+| `handler_container_label` | Label number of the handler container block |
+| `structural_types` | Maps label numbers to block types (loop/block/if) |
+
+**block_extraction strategy additional fields:**
+
+| Field | Description |
+|-------|-------------|
+| `extraction_depths` | List of nesting depths to look for extraction targets |
+| `min_block_size` | Minimum block size (WAT lines) to consider for extraction |
+| `max_block_size` | Maximum block size to extract (prevents oversized helpers) |
 
 ## Verification
 
@@ -189,7 +303,7 @@ Run the project's full test suite to verify the split WASM produces identical be
 mvn test
 ```
 
-All existing tests exercise SQLite through the split VDBE function. Any handler transformation error will surface as a test failure.
+All existing tests exercise SQLite through the split functions. Any transformation error will surface as a test failure.
 
 ### WASM Validation
 
@@ -201,27 +315,11 @@ wasm-validate wasm-lib/libsqlite3_split.wasm
 
 This checks structural correctness (type mismatches, invalid branch depths, malformed sections) but not semantic equivalence.
 
-### Script Output
+### Binary Size Check
 
-The script itself prints diagnostic information:
+Verify that generated functions are under the 8KB threshold:
 
+```bash
+wasm2wat wasm-lib/libsqlite3_split.wasm | grep -c "func"  # count functions
+wasm-objdump -h wasm-lib/libsqlite3_split.wasm             # section sizes
 ```
-[1/6] Converting ... to WAT
-[2/6] Parsing func 482...
-  br_table at line ...
-  278 opcode handlers
-  8 structural code regions
-[3/6] Computing group boundaries...
-  Group 0: handlers [0, 56) = 56 handlers
-  Group 1: handlers [56, 112) = 56 handlers
-  ...
-[4/6] Generating group functions...
-[5/6] Generating modified func 482...
-[6/6] Assembling output WAT...
-
-  Input size:  ... bytes
-  Output size: ... bytes
-  Overhead:    ... bytes (...)
-```
-
-Review the handler counts, group sizes, and binary overhead to confirm the transformation completed as expected.
