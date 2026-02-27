@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WASM Function Splitting - Performance Summary</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #c9d1d9; padding: 40px; }
+  h1 { font-size: 28px; color: #e6edf3; margin-bottom: 8px; }
+  .subtitle { font-size: 15px; color: #8b949e; margin-bottom: 40px; }
+  .chart-section { max-width: 800px; margin: 0 auto 48px auto; }
+  .bar-row { display: flex; align-items: center; margin-bottom: 20px; }
+  .bar-label { width: 140px; text-align: right; padding-right: 20px; font-size: 14px; font-weight: 600; color: #e6edf3; }
+  .bar-label small { display: block; font-weight: 400; color: #8b949e; font-size: 12px; }
+  .bar-track { flex: 1; height: 48px; background: #161b22; border-radius: 6px; position: relative; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 6px; display: flex; align-items: center; justify-content: flex-end; padding-right: 14px; font-weight: 700; font-size: 18px; transition: width 0.8s ease; }
+  .bar-main .bar-fill { background: linear-gradient(90deg, #6e40c9, #8957e5); color: #fff; width: 88.9%; }
+  .bar-split3 .bar-fill { background: linear-gradient(90deg, #1f6feb, #58a6ff); color: #fff; width: 77.8%; }
+  .bar-more .bar-fill { background: linear-gradient(90deg, #da3633, #f85149); color: #fff; width: 100%; }
+  .delta { font-size: 13px; margin-left: 8px; font-weight: 400; }
+  .delta.good { color: #3fb950; }
+  .delta.bad { color: #f85149; }
+  .divider { border: none; border-top: 1px solid #21262d; margin: 40px 0; }
+  .insight-box { max-width: 800px; margin: 0 auto 32px auto; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 24px 28px; }
+  .insight-box h2 { font-size: 18px; color: #e6edf3; margin-bottom: 12px; }
+  .insight-box p { font-size: 14px; line-height: 1.7; color: #c9d1d9; margin-bottom: 12px; }
+  .insight-box p:last-child { margin-bottom: 0; }
+  .tag { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 12px; margin-right: 4px; }
+  .tag-func { background: #1f6feb22; color: #58a6ff; border: 1px solid #1f6feb44; }
+  .tag-warn { background: #d2992222; color: #e3b341; border: 1px solid #d2992244; }
+  .profiles { max-width: 800px; margin: 0 auto; }
+  .profiles h2 { font-size: 18px; color: #e6edf3; margin-bottom: 16px; }
+  .profile-grid { display: flex; flex-direction: column; gap: 16px; }
+  .profile-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+  .profile-card h3 { font-size: 14px; padding: 12px 16px; border-bottom: 1px solid #21262d; color: #e6edf3; }
+  .profile-card img { width: 100%; display: block; }
+  .arrow { font-size: 28px; text-align: center; color: #484f58; margin: 4px 0; }
+  .footer { max-width: 800px; margin: 40px auto 0 auto; text-align: center; font-size: 12px; color: #484f58; }
+</style>
+</head>
+<body>
+
+<div class="chart-section">
+  <h1>WASM Function Splitting &mdash; Performance Results</h1>
+  <p class="subtitle">Splitting SQLite's large WASM functions for HotSpot C2 JIT compilation via Chicory AOT</p>
+
+  <div class="bar-row bar-main">
+    <div class="bar-label">Baseline<small>main branch</small></div>
+    <div class="bar-track">
+      <div class="bar-fill">~8s</div>
+    </div>
+  </div>
+
+  <div class="arrow">&darr;</div>
+
+  <div class="bar-row bar-split3">
+    <div class="bar-label">Split (func 482)<small>1 func &rarr; 6 pieces</small></div>
+    <div class="bar-track">
+      <div class="bar-fill">~7s <span class="delta good">&minus;12.5%</span></div>
+    </div>
+  </div>
+
+  <div class="arrow">&darr;</div>
+
+  <div class="bar-row bar-more">
+    <div class="bar-label">Split more<small>482 + 180 + 1194</small></div>
+    <div class="bar-track">
+      <div class="bar-fill">~9s <span class="delta bad">+28.6%</span></div>
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<div class="insight-box">
+  <h2>Split Just Enough</h2>
+  <p>
+    Splitting <span class="tag tag-func">func 482</span> (the VDBE main loop) improved execution
+    from <strong>~8s to ~7s</strong>. This is the hottest path in SQLite &mdash; every opcode runs through it
+    &mdash; so enabling C2 JIT for its pieces paid off.
+  </p>
+  <p>
+    Splitting two more functions
+    (<span class="tag tag-func">func 180</span> <span class="tag tag-func">func 1194</span>)
+    pushed it back to <strong>~9s</strong>, worse than baseline.
+    The spill/reload overhead (copying all locals through memory on every helper call)
+    outweighed any JIT benefit for these less-hot functions.
+  </p>
+  <p>
+    <span class="tag tag-warn">Takeaway</span>
+    <strong>Where</strong> you split matters as much as <strong>whether</strong> you split.
+    We need better profiling to identify which functions truly justify the splitting cost.
+  </p>
+</div>
+
+<hr class="divider">
+
+<div class="profiles">
+  <h2>Flame Graphs</h2>
+  <div class="profile-grid">
+    <div class="profile-card">
+      <h3>Baseline (main) &mdash; ~8s</h3>
+      <img src="profile_main.png" alt="Flame graph - baseline">
+    </div>
+    <div class="profile-card">
+      <h3>Split func 482 only &mdash; ~7s</h3>
+      <img src="profile_split_3.png" alt="Flame graph - split func 482">
+    </div>
+    <div class="profile-card">
+      <h3>Split 482 + 180 + 1194 &mdash; ~9s</h3>
+      <img src="profile_split_more.png" alt="Flame graph - split more">
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  sqlite4j &middot; WASM function splitting experiment &middot; Chicory AOT + HotSpot C2 JIT
+</div>
+
+</body>
+</html>
