@@ -1,0 +1,33 @@
+///usr/bin/env jbang "$0" "$@" ; exit $?
+
+// //DEPS io.roastedroot:sqlite4j:3.51.2.0
+//DEPS io.roastedroot:sqlite4j:9.9.9.9-SNAPSHOT
+
+import static java.lang.System.*;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
+
+public class test_200k {
+
+    public static void main(String... args) throws SQLException {
+        out.println("Starting (200K ops)");
+
+        long before = currentTimeMillis();
+        int size = 200000;
+        Connection conn = DriverManager.getConnection("jdbc:sqlite::memory:");
+        conn.createStatement().execute("drop table if exists test");
+        conn.createStatement().execute("create table test (id int not null)");
+        for (int i = 0; i < size; i++) {
+            conn.createStatement().execute("insert into test values(" + i + ")");
+        }
+        int deletedCount = conn.createStatement().executeUpdate("delete from test");
+        conn.close();
+        long after = currentTimeMillis();
+
+        System.out.println("TIme: " + (after - before));
+
+        out.println("End");
+    }
+}

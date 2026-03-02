@@ -26,7 +26,7 @@ import tempfile
 FUNC_482_CONFIG = {
     'func_index': 482,
     'strategy': 'br_table',
-    'num_groups': 5,
+    'num_groups': 8,
     # Locals: 2 i32 params + 30 i32 declared + 2 i64 declared = 34 total
     'param_types': ['i32', 'i32'],
     'declared_types': ['i32'] * 30 + ['i64'] * 2,
@@ -45,7 +45,7 @@ FUNC_482_CONFIG = {
 FUNC_180_CONFIG = {
     'func_index': 180,
     'strategy': 'br_table',
-    'num_groups': 4,
+    'num_groups': 12,
     # Locals: 1 i32 param + 39 i32 + 6 i64 + 2 f64 = 48 total
     'param_types': ['i32'],
     'declared_types': ['i32'] * 39 + ['i64'] * 6 + ['f64'] * 2,
@@ -86,7 +86,31 @@ FUNC_1194_CONFIG = {
     'max_block_size': 4000,           # don't extract blocks > 4000 lines (too large for helpers)
 }
 
-ALL_CONFIGS = [FUNC_482_CONFIG, FUNC_180_CONFIG, FUNC_1194_CONFIG]
+FUNC_1345_CONFIG = {
+    'func_index': 1345,
+    'strategy': 'br_table',
+    'num_groups': 2,
+    # Locals: 3 i32 params + 18 i32 declared = 21 total
+    'param_types': ['i32'] * 3,
+    'declared_types': ['i32'] * 18,
+    'frame_pointer_local': 6,
+    'orig_frame_size': 144,
+    'opcode_local': 4,        # local set by local.tee before br_table
+    'handler_container_label': 32,
+    'num_structural': 32,
+    'structural_types': {
+        1: 'block', 2: 'block', 3: 'block', 4: 'block',
+        5: 'block', 6: 'block', 7: 'block', 8: 'block',
+        9: 'block', 10: 'block', 11: 'block', 12: 'block',
+        13: 'block', 14: 'block', 15: 'block', 16: 'block',
+        17: 'block', 18: 'block', 19: 'block', 20: 'block',
+        21: 'block', 22: 'block', 23: 'block', 24: 'block',
+        25: 'block', 26: 'block', 27: 'block', 28: 'block',
+        29: 'block', 30: 'block', 31: 'loop',
+    },
+}
+
+ALL_CONFIGS = [FUNC_482_CONFIG, FUNC_180_CONFIG, FUNC_1177_CONFIG]
 
 # ─── Shared Infrastructure ───────────────────────────────────────────────────
 
