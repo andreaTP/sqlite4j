@@ -135,8 +135,37 @@ branch transformation bug. Config preserved but NOT included in ALL_CONFIGS.
 - func_1146 (16,968B) — cold (0.0% self)
 - func_921 (8,591B) — cold (0.0% self)
 
+## Experiment 10: 7-function auto split (--auto mode, 200K)
+
+**Config:** `python3 split_wasm.py --auto --skip=921,1184,2482,1936,1517,103,1146`
+- func_180: br_table, 12 groups (auto-detected)
+- func_482: br_table, 9 groups (auto-detected)
+- func_1194: block_extraction, 2 helpers (depths [6,7])
+- func_1260: block_extraction, 3 helpers (depths [3,4])
+- func_1177: block_extraction, 4 helpers (depth 4)
+- func_1435: br_table, 3 groups (auto-detected)
+- func_1345: br_table, 3 groups (auto-detected, 31 structural labels — NOW WORKS)
+- WASM overhead: 53KB (6.1%)
+- All 432 tests pass
+
+**A/B comparison (same session, 200K ops):**
+
+| Config | Run 1 | Run 2 | Run 3 | Best | vs Baseline |
+|--------|-------|-------|-------|------|-------------|
+| Baseline (no split) | 27,657 | 28,798 | 27,912 | 27,657 | — |
+| 3-func manual (482+180+1177) | 19,595 | 18,421 | 16,838 | 16,838 | **-39%** |
+| **7-func auto** | **17,039** | **15,696** | **15,286** | **15,286** | **-45%** |
+
+**Analysis:**
+- 7-function auto split is **9% faster** than 3-function manual at best-of
+- func_1345 now works (was failing before — the auto-detected 3-group config avoids
+  the branch depth bugs that occurred with manual 2-group config)
+- func_1194/func_1260 helpers are oversized (9688/7148 WAT lines) but the dispatchers
+  are small, so even partial extraction helps
+- Total improvement: **45% faster than unsplit baseline**
+
 ### Future work:
-1. Fix func_1345 split (debug branch transformation for 31 structural labels)
-2. Fix func_1194 block extraction (dispatcher still >8KB after extraction)
-3. Explore Chicory-side bytecode splitting to avoid WASM-level spill/reload entirely
+1. Fix func_1194/func_1260 oversized helpers (recursive extraction or more depths)
+2. Fix block extraction for typed blocks (func_921, func_1184, etc.)
+3. Implement as Binaryen pass (`wasm-opt --split-large-funcs`)
 4. Reduce spill/reload cost via selective spilling or passing locals as params

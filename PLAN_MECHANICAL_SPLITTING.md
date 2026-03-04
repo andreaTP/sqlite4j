@@ -52,12 +52,18 @@ Condition (2) requires runtime profiling or can be approximated by call-graph an
 
 ### Action items
 
-1. Write a script that parses the compiled class file and lists all `func_*` methods
-   with their bytecode sizes. (We already have this code inline — extract it.)
-2. Correlate WAT line counts with bytecode sizes for all 2712 functions. Plot or
-   compute the regression. Identify outliers.
-3. Determine if there's a WAT-based heuristic that's safe (e.g., "split if >2000
-   WAT lines" with enough margin that we never miss a >8KB function).
+1. ✅ Write a script that parses the compiled class file and lists all `func_*` methods
+   with their bytecode sizes. → `check_bytecodes.py`
+2. ✅ Correlate WAT line counts with bytecode sizes for all 2649 functions.
+   → `correlate_wat_bytecode.py` — Results:
+   - **Median ratio: 2.71 bytes/WAT-line**, StdDev 0.44, very tight P10-P90: 2.14-3.18
+   - **WAT threshold of 2500 lines catches all 9 >8KB functions** (5 false positives)
+   - **WAT threshold of 2000 lines catches all 9 >8KB functions** (8 false positives)
+   - Functions >8KB have ratios 2.50-2.97 (all within 1 StdDev of median)
+3. ✅ Safe WAT-based heuristic: **split if >2500 WAT lines**
+   - Catches 100% of >8KB functions
+   - Only 5 false positives (functions that are <8KB but >2500 WAT lines)
+   - Conservative formula: `estimated_bytecode ≈ WAT_lines × 3.0` (P75 ratio)
 
 ---
 
@@ -106,13 +112,23 @@ Detection algorithm:
 
 ### Action items
 
-4. Implement `auto_detect_config(wat_lines, func_start, func_end)` that returns a
-   complete config dict by parsing the WAT. Test it against the 3 known-good configs
-   (func_482, func_180, func_1177) and verify it produces equivalent configs.
-5. For br_table strategy: implement handler container detection (find the block that
-   wraps all br_table target blocks).
-6. For block_extraction strategy: implement automatic depth/size selection (find
-   depths with extractable blocks that would reduce bytecode below 8KB).
+4. ✅ Implement `auto_detect_config(wat_lines, func_start, func_end)` that returns a
+   complete config dict by parsing the WAT. → `auto_detect_config.py`
+   - Validated against all 4 known-good configs (func_482, func_180, func_1345, func_1177) — ALL PASS
+   - Detects: param_types, declared_types, frame_pointer_local, orig_frame_size,
+     strategy, opcode_local, handler_container_label, num_structural, structural_types
+   - Identifies 14 candidate functions >2500 WAT lines
+   - 6 use br_table strategy, 8 use block_extraction
+5. ✅ For br_table strategy: handler container detection implemented using:
+   - Staircase detection (consecutive block labels ending at @max_label)
+   - Wrapper detection (if preceded by a loop with code gap, skip the structural wrapper)
+6. ✅ For block_extraction strategy: automatic depth/size selection → `auto_detect_config.py`
+   - "Fan-out depth" heuristic: finds shallowest depth with ≥2 blocks ≥ min_block_size
+   - If any block at primary depth > 2500 WAT lines, adds deeper depths for sub-extraction
+   - Default min_block_size = 200 (matches known-good func_1177 config)
+   - Validated against func_1177: auto-detects extraction_depth=4, min_block_size=200 ✓
+   - Also detects has_result field for all strategies
+   - All 8 block_extraction candidates now have auto-detected configs
 
 ---
 
@@ -162,31 +178,63 @@ loop, which is slow (~15s per iteration).
 
 ### Action items
 
-7. Measure the performance impact of "too many groups" — compare func_482 with 8
-   groups vs 12 groups vs 16 groups. If the overhead is small, overshooting is cheap.
-8. Implement the iterative approach (C) as a fallback. Wire up: split → compile →
-   check bytecodes → adjust → repeat.
+7. ✅ Measure the performance impact of "too many groups" — func_482 overshoot test:
+   - 8 groups: best 19,517ms (avg 21,260ms) — optimal
+   - 12 groups: best 22,124ms (avg 22,411ms) — **+13% vs optimal**
+   - 16 groups: best 23,928ms (avg 24,773ms) — **+23% vs optimal**
+   - **Conclusion: overshooting is NOT free.** 2x overshoot costs ~23% on the hottest
+     function. Moderate overshoot (~1.5x) costs ~13%. Both still beat unsplit baseline
+     (39,375ms) by a wide margin, so a small safety margin is OK but large overshoot
+     is too expensive. The iterative compile loop (approach C/D) is needed for optimal
+     results.
+8. ✅ Implemented `--auto` mode in `split_wasm.py`:
+   - `auto_detect_all_configs()` scans WAT for all functions >2500 lines
+   - Auto-detects strategy, params, locals, frame setup, handler structure
+   - Group count heuristic: `ceil(WAT_lines × 3.0 / 4000) + 1` — uses 4KB target
+     per group (conservative, because undershoot causes correctness bugs while
+     +13% overshoot penalty is acceptable)
+   - `--skip=idx1,idx2,...` to exclude functions that fail (typed blocks, etc.)
+   - Skips functions where auto-detection returns None for critical fields
+   - Successfully splits 7 functions, all 432 tests pass
+   - Functions still needing work: func_1194 (helper too large), func_1260 (helper too large)
+   - Skipped functions: func_921, func_1184, func_2482, func_1936, func_1517, func_103, func_1146
+     (cold or block_extraction with typed blocks causing wat2wasm type errors)
 9. Build a WAT-to-bytecode estimator (approach B) by analyzing the compiled output
    for all functions and computing instruction-level weights.
+   (Lower priority — the 4KB heuristic works well enough for now.)
 
 ---
 
 ## Part 4: Failure Modes to Handle
 
-### func_1345: Many structural labels (31 labels)
+### func_1345: Many structural labels (31 labels) — FIXED
 
-The br_table strategy failed with 6 test errors when the function had 31 structural
-labels before the handler container. The branch transformation logic converts handler
-branches to "continuation codes" that are dispatched via br_table in the caller. With
-31 structural labels, the continuation code space and branch depth calculations may
-overflow or miscalculate.
+The br_table strategy failed with 6 test errors ("out of bounds memory access:
+attempted to access address: -16"). The root cause was NOT the branch depth formula
+(verified correct for S=31) but the **br_table-inside-handler** transformation.
 
-**To investigate:**
-- Which specific branch transformation produces the wrong code?
-- Run `wasm-validate` (it passed!) — so the bug is semantic, not structural.
-- Add a WAT-level diff test: extract one handler, validate, run a targeted test.
-- Consider: is there a structural limit on how many structural labels the splitter
-  can handle? If so, document it and fall back to block_extraction.
+**Root cause:** Handler 1 contained 3 cascading br_tables with entries targeting
+different structural labels (@10, @18, @19, @20, @25, @28, @30, etc.). The original
+`transform_handler_code` mapped ALL structural/cross-group entries to the `$exit`
+depth WITHOUT setting continuation codes. The group function returned 0 (no
+continuation), causing the main function to exit the dispatch loop instead of
+branching to the correct structural label.
+
+**Why func_482/func_180 worked:** Their individual handlers use `br`/`br_if` for
+structural exits (not br_table), which correctly set cont_code via the existing
+simple-branch transformation.
+
+**Fix:** Wrapper landing blocks with save/reload pattern:
+1. Classify each br_table entry as internal, within_group, container, structural,
+   or cross_group
+2. For structural/cross_group entries, create K wrapper landing blocks
+3. Save dispatch value to `result_local_idx` before wrapper blocks (avoids WASM
+   block stack isolation — blocks hide enclosing stack values)
+4. Reload dispatch value inside innermost wrapper
+5. Each landing block sets its continuation code and branches to `$exit`
+
+**Result:** All 432 tests pass. No structural label limit — the fix handles
+arbitrary numbers of structural labels correctly.
 
 ### func_1194: Pieces still >8KB after extraction
 
@@ -217,56 +265,146 @@ a helper function would return from the helper, not from the original function.
 
 ### Action items
 
-10. Debug func_1345 failure: add targeted test, examine generated WAT for the failing
-    handler, compare against original WAT.
+10. ✅ Debug func_1345 failure: FIXED — br_table-inside-handler entries now correctly
+    set continuation codes via wrapper landing blocks with save/reload pattern.
 11. For func_1194: try br_table strategy (inspect the 7 br_tables to find a main
     dispatch pattern) and try extracting at more depths.
 12. Survey all >8KB functions for `return` instructions in potential extraction blocks.
 
 ---
 
-## Part 5: End-to-End Automation Sketch
+## Part 5: Implementation in Binaryen (LATER — after rules are nailed down)
 
-If all the above investigations succeed, the fully automated flow would be:
+**Important:** Do NOT start with Binaryen. Stay in Python for the exploration phase.
+The splitting rules, edge cases, and group-count strategy are still being discovered.
+Python's edit-run-check cycle is 10x faster than C++ for this kind of iteration.
+Move to Binaryen only after the rules are clear enough to write a spec.
+
+Additionally, the spill/reload mechanism is Chicory-specific (saves WASM locals to
+linear memory to pass them between Java methods). This is not a general WASM
+optimization — it's a workaround for JVM bytecode size limits. A Binaryen pass
+would need to be designed around this JVM-specific quirk.
+
+The production implementation of mechanical splitting should eventually be done as a
+Binaryen pass. Binaryen (`/home/andreatp/workspace/binaryen`) is the standard WASM
+optimization toolchain and has infrastructure for function-level transformations.
+
+### Why Binaryen (when the time comes)
+
+- **Proper IR**: Binaryen operates on a structured IR, not text. No regex parsing of
+  WAT, no off-by-one errors in label depth calculations (the likely cause of the
+  func_1345 failure).
+- **Existing passes**: Binaryen already has passes for inlining, dead code elimination,
+  local optimization. A splitting pass fits naturally.
+- **Composable**: Users can run `wasm-opt --split-large-funcs -o output.wasm input.wasm`
+  as part of their build pipeline.
+- **Type-safe transformations**: Creating new functions, adjusting branch targets, and
+  managing locals are all first-class operations in the Binaryen API.
+- **Reusable**: Benefits any WASM-to-JVM pipeline, not just sqlite4j.
+
+### Exploration plan (in /home/andreatp/workspace/binaryen)
+
+1. **Study existing passes** — Read a simple pass (e.g., `src/passes/Inlining.cpp` or
+   `src/passes/MergeBlocks.cpp`) to understand the pass infrastructure: how to iterate
+   functions, create new functions, modify function bodies, manage types.
+
+2. **Study the IR** — Understand how Binaryen represents:
+   - Function bodies (`Expression*` tree)
+   - `Switch` (br_table equivalent)
+   - `Block`, `Loop`, `If` nesting
+   - Local variables and their types
+   - Branch targets and label resolution
+
+3. **Prototype the detection** — Write a pass that:
+   - Walks all functions
+   - Estimates output size (Binaryen has `BinaryenGetExpressionInfo` / size estimation)
+   - Identifies functions with `Switch` (br_table) dispatch patterns
+   - Logs candidates: function index, estimated size, handler count, local count
+
+4. **Prototype the split** — For br_table functions:
+   - Create N new functions with the same local types + 2 extra params (frame_ptr, handler_idx)
+   - Move handler expressions from the original Switch into group functions
+   - Replace handlers in the original with stubs (set index, break out)
+   - Add spill/reload/dispatch logic to the original
+   - Register new functions in the module
+
+5. **Test against sqlite4j** — Run the Binaryen pass on `libsqlite3.wasm`, then use
+   the output in sqlite4j's build. Verify all 432 tests pass and benchmark.
+
+### Key Binaryen files to study
 
 ```
-auto_split(input_wasm, output_wasm):
-  1. wat = wasm2wat(input_wasm)
-  2. for each function in wat:
-       config = auto_detect_config(function)
-       if config.estimated_bytecode > 8000:
-         configs.append(config)
-  3. split_wat = apply_splits(wat, configs)
-  4. output_wasm = wat2wasm(split_wat)
-  5. compile with Chicory, extract bytecode sizes
-  6. for any piece >8KB:
-       increase that function's group count
-       goto 3
-  7. validate: wasm-validate + test suite
+src/pass.h                    — Pass infrastructure
+src/passes/                   — All existing passes
+src/passes/Inlining.cpp       — Creates new functions, moves code between them
+src/passes/FuncCastEmulation.cpp — Wraps functions, relevant pattern
+src/wasm.h                    — Core IR types (Function, Expression, Block, Switch, etc.)
+src/wasm-builder.h            — Builder API for constructing IR nodes
+src/ir/branch-utils.h         — Branch target manipulation utilities
+src/ir/local-utils.h          — Local variable utilities
+src/ir/utils.h                — Expression walking, cloning, replacement
 ```
 
-The manual steps that remain hard to automate:
-- Choosing optimal group counts without compilation feedback
-- Handling edge cases (many structural labels, return in blocks)
-- Deciding whether a function is "hot enough" to justify splitting overhead
+### What changes vs the Python approach
+
+| Aspect | Python (split_wasm.py) | Binaryen pass |
+|--------|----------------------|---------------|
+| Input format | WAT text | Binary WASM / structured IR |
+| Branch handling | Regex + manual depth tracking | IR-level, type-checked |
+| New function creation | String concatenation | API: `module->addFunction(...)` |
+| Label resolution | Manual relative depth math | Automatic via IR |
+| Size estimation | Post-hoc (compile, check) | Binaryen's built-in size estimation |
+| Error-prone parts | Label depth, local index offset | Minimal — IR handles these |
+| Reusability | sqlite4j only | Any WASM project |
 
 ### Action items
 
-13. Prototype `auto_detect_config()` for br_table functions.
-14. Prototype a bytecode-size-checking script that reads the Chicory-generated class.
-15. Wire them together into a single `--auto` mode in split_wasm.py.
+13. Explore Binaryen pass infrastructure: read 2-3 existing passes, understand the API.
+14. Prototype a "detect large functions" pass that logs candidates.
+15. Prototype br_table splitting for a single function (func_482) in Binaryen.
+16. Compare generated output against split_wasm.py output for correctness.
+17. Extend to handle block_extraction strategy.
+18. Add `--split-large-funcs` flag or similar to wasm-opt.
+
+---
+
+## Part 6: End-to-End Automation Sketch
+
+Whether implemented in Python (short term) or Binaryen (long term), the fully
+automated flow is:
+
+```
+auto_split(input_wasm, output_wasm, bytecode_threshold=8000):
+  1. Analyze all functions: estimate size, detect strategy
+  2. For each function likely to exceed threshold:
+       - Detect config automatically (params, locals, frame_ptr, br_table structure)
+       - Choose initial group count (generous estimate)
+       - Apply split
+  3. Compile output with Chicory, measure actual bytecode sizes
+  4. For any piece still >threshold:
+       - Increase that function's group count
+       - Re-split and recompile
+  5. Validate: wasm-validate + test suite
+```
+
+The manual steps that remain hard to automate:
+- Choosing optimal group counts without compilation feedback (mitigated by step 4)
+- Handling edge cases (many structural labels, return in blocks)
+- Deciding whether a function is "hot enough" to justify splitting overhead
 
 ---
 
 ## Execution Order
 
-| Priority | Task | Why |
-|----------|------|-----|
-| 1 | Extract bytecode size checker into reusable script (item 1) | Foundation for everything else |
-| 2 | Correlate WAT lines with bytecode sizes (item 2) | Determines if we can predict sizes |
-| 3 | Implement auto_detect_config for br_table (items 4-5) | Eliminates manual config writing |
-| 4 | Debug func_1345 failure (item 10) | Understand structural label limits |
-| 5 | Test "overshoot" group count strategy (item 7) | If cheap, simplifies group selection |
-| 6 | Implement iterative compilation loop (item 8) | Reliable fallback for group sizing |
-| 7 | Tackle func_1194 (item 11) | Third-hottest function |
-| 8 | Wire up --auto mode (items 13-15) | Full automation |
+| Priority | Task | Where | Why |
+|----------|------|-------|-----|
+| 1 | Extract bytecode size checker into reusable script (item 1) | sqlite4j | Foundation for everything else |
+| 2 | Correlate WAT lines with bytecode sizes (item 2) | sqlite4j | Determines if we can predict sizes |
+| 3 | Explore Binaryen pass infrastructure (item 13) | binaryen | Understand the target platform |
+| 4 | Implement auto_detect_config for br_table in Python (items 4-5) | sqlite4j | Quick prototype, validates the logic |
+| 5 | Debug func_1345 failure (item 10) | sqlite4j | Understand structural label limits |
+| 6 | Prototype "detect large functions" Binaryen pass (item 14) | binaryen | First Binaryen deliverable |
+| 7 | Test "overshoot" group count strategy (item 7) | sqlite4j | If cheap, simplifies group selection |
+| 8 | Prototype br_table splitting in Binaryen (item 15) | binaryen | Core Binaryen deliverable |
+| 9 | Tackle func_1194 (item 11) | sqlite4j | Third-hottest function |
+| 10 | Full Binaryen pass with iterative sizing (items 16-18) | binaryen | Production-ready tool |

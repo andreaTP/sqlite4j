@@ -469,14 +469,18 @@ def transform_handler_code(handler_code, handler_orig_index, group_start, group_
     orig_depth_to_container = num_dispatch_blocks - H
 
     internal_depth = 0
+    # Track block result types for br_table type compatibility
+    internal_block_types = []  # stack of result_type (str or None) for each open block
 
     transformed = []
     for line in handler_code:
         stripped = line.strip()
 
-        # Track internal nesting
+        # Track internal nesting and block types
         if stripped.startswith(('block', 'loop', 'if')) and not stripped.startswith(('block)', 'loop)', 'if)')):
             internal_depth += 1
+            rt_match = re.search(r'\(result (\w+)\)', stripped)
+            internal_block_types.append(rt_match.group(1) if rt_match else None)
 
         # Transform local.get/set/tee
         local_match = re.match(r'^(\s*)(local\.(get|set|tee))\s+(\d+)(.*)', line.rstrip())
@@ -489,6 +493,8 @@ def transform_handler_code(handler_code, handler_orig_index, group_start, group_
             transformed.append(f'{indent}{op} {new_idx}{rest}\n')
             if stripped.startswith('end'):
                 internal_depth -= 1
+                if internal_block_types:
+                    internal_block_types.pop()
             continue
 
         # Transform br N (;@M;) and br_if N (;@M;)
@@ -593,42 +599,114 @@ def transform_handler_code(handler_code, handler_orig_index, group_start, group_
 
             if stripped.startswith('end'):
                 internal_depth -= 1
+                if internal_block_types:
+                    internal_block_types.pop()
             continue
 
         # Transform br_table with mixed targets
         if stripped.startswith('br_table'):
             bt_entries = re.findall(r'(\d+)\s*\(;@(\d+);\)', stripped)
             if bt_entries:
-                new_entries = []
+                # Classify each entry
+                entries_classified = []
+                cont_codes_needed = {}  # cont_code → True
                 for depth_str, label_str in bt_entries:
                     old_d = int(depth_str)
                     if old_d < internal_depth:
-                        new_entries.append(depth_str)
+                        entries_classified.append(('internal', old_d, None))
                     else:
                         effective_external = old_d - internal_depth
                         if effective_external < G_size - 1 - H_local:
-                            new_entries.append(depth_str)
+                            entries_classified.append(('within_group', old_d, None))
                         elif effective_external == orig_depth_to_container:
-                            new_d = internal_depth + (G_size - 1 - H_local)
-                            new_entries.append(str(new_d))
+                            entries_classified.append(('container', old_d, None))
                         elif effective_external > orig_depth_to_container:
-                            new_d = internal_depth + (G_size - H_local)
+                            structural_offset = effective_external - orig_depth_to_container
+                            structural_label = handler_container - structural_offset
+                            cont_code = structural_label
+                            entries_classified.append(('structural', old_d, cont_code))
+                            cont_codes_needed[cont_code] = True
+                        else:
+                            target_handler_idx = H + effective_external + 1
+                            cont_code = 100 + target_handler_idx
+                            entries_classified.append(('cross_group', old_d, cont_code))
+                            cont_codes_needed[cont_code] = True
+
+                indent_str = line[:len(line) - len(line.lstrip())]
+
+                if cont_codes_needed:
+                    # Need wrapper landing blocks for continuation codes.
+                    # WASM blocks create stack isolation, so we must save the
+                    # dispatch value to a local before entering wrapper blocks,
+                    # then reload it inside.
+                    sorted_codes = sorted(cont_codes_needed.keys())
+                    K = len(sorted_codes)
+                    code_to_wrapper_idx = {c: i for i, c in enumerate(sorted_codes)}
+
+                    # Save dispatch value (currently on stack) to temp local
+                    transformed.append(f'{indent_str}local.set {result_local_idx} ;; save dispatch value\n')
+
+                    # Emit K wrapper blocks (outermost = last code, innermost = first)
+                    for k in range(K):
+                        transformed.append(f'{indent_str}block ;; cont_code landing {sorted_codes[K - 1 - k]}\n')
+
+                    # Reload dispatch value inside innermost wrapper
+                    transformed.append(f'{indent_str}local.get {result_local_idx} ;; reload dispatch value\n')
+
+                    # Emit modified br_table — ALL non-wrapper entries need +K depth
+                    new_entries = []
+                    for kind, old_d, cont_code in entries_classified:
+                        if kind == 'internal':
+                            new_entries.append(str(old_d + K))
+                        elif kind == 'within_group':
+                            new_entries.append(str(old_d + K))
+                        elif kind == 'container':
+                            new_d = internal_depth + K + (G_size - 1 - H_local)
+                            new_entries.append(str(new_d))
+                        elif kind in ('structural', 'cross_group'):
+                            wrapper_idx = code_to_wrapper_idx[cont_code]
+                            new_entries.append(str(wrapper_idx))
+
+                    transformed.append(f'{indent_str}br_table {" ".join(new_entries)}\n')
+
+                    # Emit landing blocks (close wrappers, set cont_code, branch to $exit)
+                    for k in range(K):
+                        cont_code = sorted_codes[k]
+                        # Depth to $exit: remaining wrappers + handler internal + dispatch blocks
+                        exit_depth = (K - 1 - k) + internal_depth + (G_size - H_local)
+                        transformed.append(f'{indent_str}end ;; landing for cont_code {cont_code}\n')
+                        transformed.append(f'{indent_str}i32.const {cont_code}\n')
+                        transformed.append(f'{indent_str}local.set {result_local_idx}\n')
+                        transformed.append(f'{indent_str}br {exit_depth} ;; → $exit\n')
+                else:
+                    # No continuation codes needed — simple transformation
+                    new_entries = []
+                    for kind, old_d, _ in entries_classified:
+                        if kind == 'internal':
+                            new_entries.append(str(old_d))
+                        elif kind == 'within_group':
+                            new_entries.append(str(old_d))
+                        elif kind == 'container':
+                            new_d = internal_depth + (G_size - 1 - H_local)
                             new_entries.append(str(new_d))
                         else:
                             new_d = internal_depth + (G_size - H_local)
                             new_entries.append(str(new_d))
 
-                indent_str = line[:len(line) - len(line.lstrip())]
-                transformed.append(f'{indent_str}br_table {" ".join(new_entries)}\n')
+                    transformed.append(f'{indent_str}br_table {" ".join(new_entries)}\n')
             else:
                 transformed.append(line)
 
             if stripped.startswith('end'):
                 internal_depth -= 1
+                if internal_block_types:
+                    internal_block_types.pop()
             continue
 
         if stripped == 'end' or (stripped.startswith('end') and not stripped.startswith('end)')):
             internal_depth -= 1
+            if internal_block_types:
+                internal_block_types.pop()
 
         transformed.append(line)
 
@@ -1431,13 +1509,95 @@ def split_block_extraction_func(wat_lines, config, next_func_idx):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+def auto_detect_all_configs(wat_lines, min_wat_lines=2500, skip_indices=None):
+    """Auto-detect splitting configs for all functions exceeding the WAT line threshold.
+
+    Returns a list of config dicts ready for use with split_brtable_func or
+    split_block_extraction_func.
+    """
+    if skip_indices is None:
+        skip_indices = set()
+    from auto_detect_config import auto_detect_config, find_func_boundaries
+
+    # Find all functions and their sizes
+    func_pattern = re.compile(r'\(func\s+\(;(\d+);\)')
+    func_indices = []
+    for line in wat_lines:
+        m = func_pattern.search(line)
+        if m:
+            func_indices.append(int(m.group(1)))
+
+    candidates = []
+    for func_idx in func_indices:
+        if func_idx in skip_indices:
+            continue
+        start, end = find_func_boundaries(wat_lines, func_idx)
+        if start is not None and end is not None:
+            size = end - start + 1
+            if size > min_wat_lines:
+                candidates.append((func_idx, size))
+
+    candidates.sort(key=lambda x: -x[1])
+    print(f'\n[auto] Found {len(candidates)} functions > {min_wat_lines} WAT lines')
+
+    configs = []
+    for func_idx, wat_size in candidates:
+        config = auto_detect_config(wat_lines, func_idx)
+        if config is None:
+            continue
+
+        strategy = config['strategy']
+        locals_count = len(config['param_types']) + len(config['declared_types'])
+
+        if strategy == 'br_table':
+            # Validate required fields
+            if config.get('opcode_local') is None:
+                print(f'  func_{func_idx:>5}: {wat_size:>6} WAT, {strategy:>18}, '
+                      f'{locals_count:>3} locals — SKIPPED (no opcode_local detected)')
+                continue
+            if config.get('handler_container_label') is None:
+                print(f'  func_{func_idx:>5}: {wat_size:>6} WAT, {strategy:>18}, '
+                      f'{locals_count:>3} locals — SKIPPED (no handler_container detected)')
+                continue
+            # Convert estimated_num_groups to num_groups
+            config['num_groups'] = config.pop('estimated_num_groups', 2)
+            detail = f"handlers={config.get('num_handlers', '?')}, groups={config['num_groups']}"
+        else:
+            if config.get('frame_pointer_local') is None:
+                print(f'  func_{func_idx:>5}: {wat_size:>6} WAT, {strategy:>18}, '
+                      f'{locals_count:>3} locals — SKIPPED (no frame pointer detected)')
+                continue
+            depths = config.get('extraction_depths',
+                                [config.get('extraction_depth', '?')])
+            detail = f"depths={depths}, min_size={config.get('min_block_size', 200)}"
+
+        print(f'  func_{func_idx:>5}: {wat_size:>6} WAT, {strategy:>18}, '
+              f'{locals_count:>3} locals, {detail}')
+        configs.append(config)
+
+    return configs
+
+
 def main():
-    if len(sys.argv) != 3:
-        print(f'Usage: {sys.argv[0]} <input.wasm> <output.wasm>')
+    auto_mode = '--auto' in sys.argv
+    skip_set = set()
+    remaining_args = []
+    for a in sys.argv[1:]:
+        if a == '--auto':
+            continue
+        if a.startswith('--skip='):
+            skip_set = {int(x) for x in a.split('=')[1].split(',')}
+            continue
+        remaining_args.append(a)
+
+    if len(remaining_args) != 2:
+        print(f'Usage: {sys.argv[0]} [--auto] [--skip=idx1,idx2,...] <input.wasm> <output.wasm>')
+        print(f'  --auto         Auto-detect all candidate functions and split them')
+        print(f'  --skip=1,2,3   Skip specific function indices')
         sys.exit(1)
 
-    input_wasm = sys.argv[1]
-    output_wasm = sys.argv[2]
+    input_wasm = remaining_args[0]
+    output_wasm = remaining_args[1]
 
     print(f'[1] Converting {input_wasm} to WAT...')
     with tempfile.NamedTemporaryFile(suffix='.wat', delete=False, mode='w') as f:
@@ -1452,12 +1612,14 @@ def main():
     print(f'  Last function index: {last_func_idx}')
     next_func_idx = last_func_idx + 1
 
+    configs = auto_detect_all_configs(wat_lines, skip_indices=skip_set) if auto_mode else ALL_CONFIGS
+
     # Collect all transformations: (func_start, func_end, modified_lines)
     transformations = []
     all_new_functions = []
     new_type_lines = []
 
-    for config in ALL_CONFIGS:
+    for config in configs:
         func_idx = config['func_index']
         strategy = config['strategy']
         print(f'\n[*] Processing func {func_idx} ({strategy})...')
